@@ -388,3 +388,117 @@ fn features() {
         "all() with Some(true) and None evaluates to None"
     );
 }
+
+#[derive(Clone, Debug)]
+enum BoolExpr {
+    Flag(&'static str),
+    Not(Box<BoolExpr>),
+    All(Vec<BoolExpr>),
+    Any(Vec<BoolExpr>),
+}
+
+impl BoolExpr {
+    fn eval(&self, a: bool, b: bool) -> bool {
+        match self {
+            Self::Flag("a") => a,
+            Self::Flag("b") => b,
+            Self::Flag(name) => panic!("unexpected test flag: {name}"),
+            Self::Not(inner) => !inner.eval(a, b),
+            Self::All(children) => children.iter().all(|child| child.eval(a, b)),
+            Self::Any(children) => children.iter().any(|child| child.eval(a, b)),
+        }
+    }
+
+    fn to_cfg_string(&self) -> String {
+        match self {
+            Self::Flag(name) => (*name).to_owned(),
+            Self::Not(inner) => format!("not({})", inner.to_cfg_string()),
+            Self::All(children) => format!("all({})", join_children(children)),
+            Self::Any(children) => format!("any({})", join_children(children)),
+        }
+    }
+}
+
+fn join_children(children: &[BoolExpr]) -> String {
+    let mut out = String::new();
+    for (index, child) in children.iter().enumerate() {
+        if index != 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&child.to_cfg_string());
+    }
+    out
+}
+
+fn bounded_bool_exprs(depth: usize) -> Vec<BoolExpr> {
+    const FLAGS: [&str; 2] = ["a", "b"];
+
+    let base: Vec<_> = FLAGS.into_iter().map(BoolExpr::Flag).collect();
+
+    if depth == 0 {
+        return base;
+    }
+
+    let smaller = bounded_bool_exprs(depth - 1);
+    let mut exprs = smaller.clone();
+
+    exprs.extend(
+        smaller
+            .iter()
+            .cloned()
+            .map(|expr| BoolExpr::Not(Box::new(expr))),
+    );
+
+    for op in [false, true] {
+        exprs.push(if op {
+            BoolExpr::Any(Vec::new())
+        } else {
+            BoolExpr::All(Vec::new())
+        });
+
+        for child in &smaller {
+            exprs.push(if op {
+                BoolExpr::Any(vec![child.clone()])
+            } else {
+                BoolExpr::All(vec![child.clone()])
+            });
+        }
+
+        for left in &smaller {
+            for right in &smaller {
+                exprs.push(if op {
+                    BoolExpr::Any(vec![left.clone(), right.clone()])
+                } else {
+                    BoolExpr::All(vec![left.clone(), right.clone()])
+                });
+            }
+        }
+    }
+
+    exprs
+}
+
+#[test]
+fn bounded_bool_eval_bridge_matches_recursive_semantics() {
+    let exprs = bounded_bool_exprs(2);
+    assert_eq!(exprs.len(), 722);
+
+    for expr in exprs {
+        let source = expr.to_cfg_string();
+        let parsed = Expression::parse(&source).unwrap();
+
+        for (a, b) in [(false, false), (false, true), (true, false), (true, true)] {
+            let expected = expr.eval(a, b);
+            let actual = parsed.eval(|pred| match pred {
+                Predicate::Flag("a") => a,
+                Predicate::Flag("b") => b,
+                _ => panic!("unexpected predicate in bounded bool bridge: {pred:?}"),
+            });
+
+            assert_eq!(
+                actual, expected,
+                "bounded bool bridge mismatch for `{source}` with a={a} b={b}"
+            );
+        }
+    }
+}
